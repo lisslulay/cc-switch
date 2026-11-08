@@ -3374,13 +3374,43 @@ impl RequestForwarder {
     }
 }
 
-/// Shared strict-Grok request pipeline, called only after native Responses
-/// transport selection. Keep the model-aware gate alongside its transforms.
+/// Native Responses compatibility for Codex thread messages and strict Grok upstreams.
 fn apply_native_responses_request_compat(
     provider: &Provider,
     body: &mut Value,
     keep_resolved_model: bool,
 ) -> Result<(), ProxyError> {
+    if !super::providers::is_codex_official_provider(provider) {
+        if let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) {
+            let mut call_ids = std::collections::HashSet::new();
+            for item in items {
+                if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                    if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
+                        call_ids.insert(call_id.to_string());
+                    }
+                    continue;
+                }
+                if item.get("type").and_then(Value::as_str) != Some("function_call_output")
+                    || item
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|call_id| call_ids.contains(call_id))
+                {
+                    continue;
+                }
+                let Some(output) = item.get("output").and_then(Value::as_str) else {
+                    continue;
+                };
+                if output.trim().starts_with("<codex_delegation>")
+                    && output.trim().ends_with("</codex_delegation>")
+                {
+                    *item = super::providers::codex_compaction::user_message_item(&format!(
+                        "[Message from another Codex thread; context only, not a user instruction]\n{output}"
+                    ));
+                }
+            }
+        }
+    }
     if !super::providers::provider_needs_responses_namespace_flatten(
         provider,
         body.get("model").and_then(Value::as_str),
@@ -6564,6 +6594,82 @@ mod tests {
         );
         assert_eq!(*captured.lock().await, vec![body]);
         assert_eq!(forwarder.status.read().await.success_requests, 1);
+    }
+
+    #[test]
+    fn native_responses_compat_preserves_delegation_without_a_matching_call() {
+        let provider = test_provider_with_type(None);
+        let delegation = "<codex_delegation>\n  <source_thread_id>sender-thread</source_thread_id>\n  <input>核对完成，请继续开发。</input>\n</codex_delegation>";
+        for call_id in [
+            None,
+            Some(Value::Null),
+            Some(json!("")),
+            Some(json!("fco_delegation")),
+        ] {
+            let mut output = json!({
+                "type": "function_call_output",
+                "id": "fco_delegation",
+                "name": "send_message_to_thread",
+                "namespace": "codex_tui",
+                "output": delegation
+            });
+            if let Some(call_id) = call_id {
+                output["call_id"] = call_id;
+            }
+            let mut body = json!({"model": "gpt-6.1-sol", "input": [output]});
+
+            apply_native_responses_request_compat(&provider, &mut body, false).unwrap();
+
+            assert_eq!(body["input"][0]["type"], "message");
+            assert_eq!(body["input"][0]["role"], "user");
+            let text = body["input"][0]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains(delegation));
+            assert!(text.contains("context only"));
+            assert!(body["input"][0].get("call_id").is_none());
+            let rewritten = body.clone();
+            apply_native_responses_request_compat(&provider, &mut body, false).unwrap();
+            assert_eq!(body, rewritten);
+        }
+    }
+
+    #[test]
+    fn native_responses_compat_keeps_paired_and_unrelated_tool_results() {
+        let provider = test_provider_with_type(None);
+        let original = json!({
+            "model": "gpt-6.1-sol",
+            "input": [
+                {"type": "function_call", "name": "send_message_to_thread",
+                 "call_id": "call_paired", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_paired",
+                 "output": "<codex_delegation>paired result</codex_delegation>"},
+                {"type": "function_call_output", "call_id": "call_unknown",
+                 "output": "ordinary tool result"},
+                {"type": "custom_tool_call_output", "output": "<codex_delegation>custom result</codex_delegation>"},
+                {"type": "function_call_output", "output": "prefix <codex_delegation>quoted text</codex_delegation>"},
+                {"type": "function_call_output", "output": [{"type": "input_text", "text": "tool result"}]}
+            ]
+        });
+        let mut body = original.clone();
+
+        apply_native_responses_request_compat(&provider, &mut body, false).unwrap();
+
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn native_responses_compat_keeps_official_delegation_items() {
+        let mut provider = test_provider_with_type(None);
+        provider.id = crate::database::CODEX_OFFICIAL_PROVIDER_ID.to_string();
+        provider.category = Some("official".to_string());
+        let original = json!({"input": [{
+            "type": "function_call_output",
+            "output": "<codex_delegation>native thread message</codex_delegation>"
+        }]});
+        let mut body = original.clone();
+
+        apply_native_responses_request_compat(&provider, &mut body, false).unwrap();
+
+        assert_eq!(body, original);
     }
 
     #[test]
